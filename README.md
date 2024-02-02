@@ -18,6 +18,7 @@ You will understand if SAHI inference help in your specific case
                      Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 
                        all          2         11      0.987      0.545       0.57      0.455
                     person          2         11      0.987      0.545       0.57      0.455
+    Speed: 1.5ms preprocess, 329.6ms inference, 0.0ms loss, 4.5ms postprocess per image
 
         ```
 * output example with **SAHI validation** on 2 images:
@@ -29,6 +30,7 @@ You will understand if SAHI inference help in your specific case
                Class     Images  Instances      Box(P          R      mAP50  mAP50-95):
                  all          2         11          1      0.545      0.773      0.628
               person          2         11          1      0.545      0.773      0.628
+      Speed: 7.5ms preprocess, 0.0ms inference, 0.0ms loss, 0.0ms postprocess per image
         
         ```
 * and also check `sahi/` folder - there all validation plots will be saved  
