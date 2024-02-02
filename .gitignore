@@ -1,2 +1,5 @@
 yolo_dataset/*
 .venv
+yolov8m.pt
+__pycache__
+.idea
