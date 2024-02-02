@@ -1,5 +1,6 @@
 # SAHI inference with YOLOv8 :dizzy:  boost your small object detection performance 
 
+### What is SAHI (Slicing Aided Hyper Inference) - https://docs.ultralytics.com/guides/sahi-tiled-inference/
 ### What in this repo:
 This repo contain not only SAHI inference implementation but also evaluation of results with mAp50, ... (standart metrics)
 
