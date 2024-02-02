@@ -7,7 +7,7 @@ You will understand if SAHI inference help in your specific case
 ### What in this repo:
 * SAHI inference + EVALUATION of results with basic yolo8 metrics 
   * output example with basic validation on 2 images:
-    * ```python
+    ```python
           val: Scanning C:\Users\irady\GitHub\YOLO8_SAHI\yolo_dataset\labels.cache.
                      Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 
                        all          2         11      0.987      0.545       0.57      0.455
