@@ -1,10 +1,16 @@
 # SAHI inference with YOLOv8 :dizzy:  boost your small object detection performance 
 
+### What in this repo:
 This repo contain not only SAHI inference implementation but also evaluation of results with mAp50, ... (standart metrics)
 
 You will understand if SAHI inference help in your specific case
 
-### What in this repo:
+| **SAHI** 	                            | **No SAHI** 	                   |
+|---------------------------------------|---------------------------------|
+| 	![pred_sahi.jpg](readme_imgs%2Fpred_sahi.jpg)                                     | 	    ![pred_no_sahi.jpg](readme_imgs%2Fpred_no_sahi.jpg)                           |
+| more cars far away detected         	 | standart detections           	 |
+
+## Run output:
 * SAHI inference + EVALUATION of results with basic yolo8 metrics 
   * output example with basic validation on 2 images:
     ```python
@@ -25,7 +31,7 @@ You will understand if SAHI inference help in your specific case
               person          2         11          1      0.545      0.773      0.628
         
         ```
-        
+* and also check `sahi/` folder - there all validation plots will be saved  
 ## What you need:
 * your .pt model file
 * validation dataset in yolo standart format
