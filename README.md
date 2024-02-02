@@ -7,7 +7,7 @@ You will understand if SAHI inference help in your specific case
 
 | **SAHI** 	                            | **No SAHI** 	                   |
 |---------------------------------------|---------------------------------|
-| 	![pred_sahi.jpg](readme_imgs%2Fpred_sahi.jpg)                                     | 	    ![pred_no_sahi.jpg](readme_imgs%2Fpred_no_sahi.jpg)                           |
+| 	![pred_sahi.jpg](https://github.com/IrDIE/YOLO8_SAHI/blob/master/readme_imgs/pred_sahi.jpg)                                     | 	    ![pred_no_sahi.jpg](https://github.com/IrDIE/YOLO8_SAHI/blob/master/readme_imgs/pred_no_sahi.jpg)                           |
 | more cars far away detected         	 | standart detections           	 |
 
 ## Run output:
