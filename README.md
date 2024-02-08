@@ -35,6 +35,17 @@ You will understand if SAHI inference help in your specific case
         
         ```
 * and also check `sahi/` folder - there all validation plots will be saved  
+
+ 
+## How to use:
+
+* git clone
+* in `validation_sahi.main()` run `run_sahi_validation()` or `run_basic_validation()`
+* in `validation_sahi.main()` change paths for your .pt and .yaml, and set desired input imgsz 
+* also you can update size  of sliding window (`slice_width` and `slice_height`) in `utils.sahi_predict()` (640 default)
+
+
+
 ## What you need:
 * your .pt model file
 * validation dataset in yolo standart format
@@ -50,9 +61,4 @@ You will understand if SAHI inference help in your specific case
     names:
       0: people
     ```
-      
-## How to use:
-
-* git clone
-* in `validation_sahi.main()` run `run_sahi_validation()` or `run_basic_validation()`
-* in `.main()` change paths for your .pt and .yaml
+     
