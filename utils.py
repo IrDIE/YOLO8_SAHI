@@ -175,10 +175,11 @@ def sahi_predict(detection_model, image_batch, slice_height = 640, slice_width =
     detection_model : compiled from def get_sahi_model()
     image_batch : torch.Size([10, 3, 1280, 1280])
     """
+    device_orig = detection_model.model.device
     batch_result = []
     for image in image_batch:
         box_annot = np.empty((0, 6)) #
-        image = image.numpy() * 255
+        image = image.cpu().numpy() * 255
         image = np.transpose(image, (1, 2, 0)).astype(np.uint8)
 
         result = get_sliced_prediction(
@@ -193,7 +194,6 @@ def sahi_predict(detection_model, image_batch, slice_height = 640, slice_width =
             x1, y1, x2, y2 = img_box.bbox.to_xyxy()
             confidence = img_box.score.value
             cls = img_box.category.id
-            #box_annot.append([[x1, y1, x2, y2, confidence, cls]])
             box_annot = np.concatenate((box_annot, [[x1, y1, x2, y2, confidence, cls]]))
-        batch_result.append(torch.tensor(box_annot))
+        batch_result.append(torch.tensor(box_annot).to(device_orig))
     return batch_result

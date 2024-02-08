@@ -97,23 +97,30 @@ def run_basic_validation(pt_model, yaml_datapath, args):
     LOGGER.info('Starting validation')
     validator()
 
-def run_sahi_validation(pt_model, yaml_datapath, args):
+def run_sahi_validation(pt_model, yaml_datapath, args, imgsz, device):
     validator_sahi = compile_validator(args=args, pt_modelpath=pt_model, yaml_datapath=yaml_datapath,
-                                       save_dir=Path('./sahi/res_SAHI/'), imgsz=640 * 2, sahi=True)
+                                       save_dir=Path('./sahi/res_SAHI/'), imgsz=imgsz, sahi=True)
     category_mapping = get_category_mapping()  # rewrite that function with your classes
     sahi_model = get_sahi_model(pt_model, category_mapping=category_mapping)
+    sahi_model.model.to(device)
     LOGGER.info('Starting SAHI validation')
     validator_sahi(sahi_model=sahi_model)
 
 def main():
     warnings.filterwarnings("ignore")
+    # here set your parameters
     pt_model = './yolov8m.pt'
     yaml_datapath = './sahi_data.yaml'
-    args = get_cfg(cfg=DEFAULT_CFG)
-    # run_sahi_validation or run_basic_validation
-    run_basic_validation(pt_model, yaml_datapath, args)
-    run_sahi_validation(pt_model, yaml_datapath, args)
+    imgsz = 640*2
 
+    # defaults params
+    args = get_cfg(cfg=DEFAULT_CFG)
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    LOGGER.info(f'device === {device}')
+
+    # run_sahi_validation or run_basic_validation
+    #run_basic_validation(pt_model, yaml_datapath, args)
+    run_sahi_validation(pt_model, yaml_datapath, args, imgsz, device)
 
 if __name__ == '__main__':
     main()
