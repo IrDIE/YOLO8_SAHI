@@ -1,15 +1,123 @@
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis
-from ultralytics.utils.checks import check_imgsz
+from ultralytics.utils import TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.ops import Profile
-from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
-from ultralytics.models.yolo.detect import DetectionValidator
+from ultralytics.utils.torch_utils import de_parallel, select_device
+from ultralytics.models.yolo.detect import DetectionValidator, DetectionPredictor
 from sahi.predict import get_sliced_prediction
 from sahi import AutoDetectionModel
 import torch
 from pathlib import Path
 import numpy as np
+from ultralytics.utils.checks import check_imgsz, check_imshow
+import threading
+from ultralytics.cfg import get_save_dir
+from ultralytics.utils import LOGGER, ops
+from ultralytics.engine.results import Results
+import cv2
+import json
+
+
+VERBOSE_SAHI = 2
+
+SLICE_H = 640
+SLICE_W = 640
+OVERLAP_HEIGHT_RATIO = 0.2
+OVERLAP_WIDTH_RATIO = 0.2
+
+
+def get_category_mapping():
+    # here should be all classes model was learning
+    category_mapping = {
+    '0': 'person',
+    '1': 'bicycle',
+    '2': 'car',
+    '3': 'motorcycle',
+    '4': 'airplane',
+    '5': 'bus',
+    '6': 'train',
+    '7': 'truck',
+    '8': 'boat',
+    '9': 'traffic light',
+    '10': 'fire hydrant',
+    '11': 'stop sign',
+    '12': 'parking meter',
+    '13': 'bench',
+    '14': 'bird',
+    '15': 'cat',
+    '16': 'dog',
+    '17': 'horse',
+    '18': 'sheep',
+    '19': 'cow',
+    '20': 'elephant',
+    '21': 'bear',
+    '22': 'zebra',
+    '23': 'giraffe',
+    '24': 'backpack',
+    '25': 'umbrella',
+    '26': 'handbag',
+    '27': 'tie',
+    '28': 'suitcase',
+    '29': 'frisbee',
+    '30': 'skis',
+    '31': 'snowboard',
+    '32': 'sports ball',
+    '33': 'kite',
+    '34': 'baseball bat',
+    '35': 'baseball glove',
+    '36': 'skateboard',
+    '37': 'surfboard',
+    '38': 'tennis racket',
+    '39': 'bottle',
+    '40': 'wine glass',
+    '41': 'cup',
+    '42': 'fork',
+    '43': 'knife',
+    '44': 'spoon',
+    '45': 'bowl',
+    '46': 'banana',
+    '47': 'apple',
+    '48': 'sandwich',
+    '49': 'orange',
+    '50': 'broccoli',
+    '51': 'carrot',
+    '52': 'hot dog',
+    '53': 'pizza',
+    '54': 'donut',
+    '55': 'cake',
+    '56': 'chair',
+    '57': 'couch',
+    '58': 'potted plant',
+    '59': 'bed',
+    '60': 'dining table',
+    '61': 'toilet',
+    '62': 'tv',
+    '63': 'laptop',
+    '64': 'mouse',
+    '65': 'remote',
+    '66': 'keyboard',
+    '67': 'cell phone',
+    '68': 'microwave',
+    '69': 'oven',
+    '70': 'toaster',
+    '71': 'sink',
+    '72': 'refrigerator',
+    '73': 'book',
+    '74': 'clock',
+    '75': 'vase',
+    '76': 'scissors',
+    '77': 'teddy bear',
+    '78': 'hair drier',
+    '79': 'toothbrush'
+}
+    return category_mapping
+
+def get_sahi_model(pt_path, model_type='yolov8', device = 'cpu'):
+    category_mapping = get_category_mapping() # rewrite that function with your classes
+    detection_model = AutoDetectionModel.from_pretrained(model_type = model_type, model_path = pt_path, \
+                                                         device = device, category_mapping = category_mapping)
+    detection_model.model.to(device)
+    return detection_model
 
 
 class DetectionValidator_SAHI(DetectionValidator):
@@ -139,12 +247,169 @@ class DetectionValidator_SAHI(DetectionValidator):
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
             return stats
 
-def get_sahi_model(pt_path, category_mapping, model_type='yolov8', device = 'cpu'):
-    detection_model = AutoDetectionModel.from_pretrained(model_type = model_type, model_path = pt_path, \
-                                                         device = device, category_mapping = category_mapping)
-    return detection_model
 
-def compile_validator(args, pt_modelpath, yaml_datapath, save_dir = Path('./sahi/res/'), imgsz = 640, sahi = False):
+class DetectionPredictor_SAHI(DetectionPredictor):
+
+    def __init__(self, args, overrides=None, _callbacks=None):
+        """
+        Initializes the BasePredictor class.
+
+        Args:
+            cfg (str, optional): Path to a configuration file. Defaults to DEFAULT_CFG.
+            overrides (dict, optional): Configuration overrides. Defaults to None.
+        """
+        self.args = args
+        self.save_dir = get_save_dir(self.args)
+        if self.args.conf is None:
+            self.args.conf = 0.25  # default conf=0.25
+        self.done_warmup = False
+        if self.args.show:
+            self.args.show = check_imshow(warn=True)
+
+        # Usable if setup is done
+        self.model = None
+        self.data = self.args.data  # data_dict
+        self.imgsz = None
+        self.device = None
+        self.dataset = None
+        self.vid_path, self.vid_writer, self.vid_frame = None, None, None
+        self.plotted_img = None
+        self.data_path = None
+        self.source_type = None
+        self.batch = None
+        self.results = None
+        self.transforms = None
+        self.callbacks = _callbacks or callbacks.get_default_callbacks()
+        self.txt_path = None
+        self._lock = threading.Lock()  # for automatic thread-safe inference
+        callbacks.add_integration_callbacks(self)
+
+    # def __call__(self, source=None, model=None, stream=False, *args, **kwargs):
+    #     return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Result into one
+
+    def __call__(self, source=None, model=None, stream=False,sahi_model=None, *args, **kwargs):
+        return list(self.stream_inference(source, model,sahi_model = sahi_model, *args, **kwargs))  # merge list of Result into one
+
+    def postprocess_sahi(self, preds, img, orig_imgs):
+        """Post-processes predictions and returns a list of Results objects."""
+        if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
+            orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
+
+        results = []
+        for i, pred in enumerate(preds):
+            orig_img = orig_imgs[i]
+            #pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+            img_path = self.batch[0][i]
+            results.append(Results(orig_img, path=img_path, names=self.model.names, boxes=pred))
+        return results
+    def stream_inference(self, source=None, model=None, sahi_model=None, *args, **kwargs):
+        """Streams real-time inference on camera feed and saves results to file."""
+        self.sahi_model = sahi_model
+        if self.args.verbose:
+            LOGGER.info("")
+
+        # Setup model
+        if not self.model :
+            self.setup_model(model)
+
+        self.nc = len(self.model.names)
+        self.stride = self.model.stride
+
+        with self._lock:  # for thread-safe inference
+            # Setup source every time predict is called
+            self.setup_source(source if source is not None else self.args.source)
+            self.imgsz = self.args.sahi_imgsz
+            # Check if save_dir/ label file exists
+            if self.args.save or self.args.save_txt:
+                (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
+
+            # Warmup model
+            if not self.done_warmup and (self.sahi_model is None):
+                self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
+                self.done_warmup = True
+
+            self.seen, self.windows, self.batch = 0, [], None
+            profilers = (
+                Profile(), Profile(), Profile()
+            )
+            self.run_callbacks("on_predict_start")
+            for batch in self.dataset:
+                self.run_callbacks("on_predict_batch_start")
+                self.batch = batch
+                path, im0s, vid_cap, s = batch
+
+                # Preprocess
+                with profilers[0]:
+                    im = self.preprocess(im0s) # CHW
+                    im_sahi = im0s
+
+                # Inference
+                with profilers[1]:
+                    if self.sahi_model is None:
+                        preds = self.inference(im, *args, **kwargs)
+                        if self.args.embed:
+                            yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
+                            continue
+
+                    if self.sahi_model:
+                        preds = sahi_predict(self.sahi_model, im_sahi)
+
+                # Postprocess
+
+                with profilers[2]:
+                    if self.sahi_model is None:
+                        self.results = self.postprocess(preds, im, im0s)
+                    else:
+                        self.results = self.postprocess_sahi(preds, im, im0s)
+
+                self.run_callbacks("on_predict_postprocess_end")
+                # Visualize, save, write results
+                n = len(im0s)
+                for i in range(n):
+                    self.seen += 1
+                    self.results[i].speed = {
+                        "preprocess": profilers[0].dt * 1e3 / n,
+                        "inference": profilers[1].dt * 1e3 / n,
+                        "postprocess": profilers[2].dt * 1e3 / n,
+                    }
+                    p, im0 = path[i], None if self.source_type.tensor else im0s[i].copy()
+                    p = Path(p)
+
+                    if self.args.verbose or self.args.save or self.args.save_txt or self.args.show:
+                        s += self.write_results(i, self.results, (p, im, im0))
+                    if self.args.save or self.args.save_txt:
+                        self.results[i].save_dir = self.save_dir.__str__()
+                    if self.args.show and self.plotted_img is not None:
+                        self.show(p)
+                    if self.args.save and self.plotted_img is not None:
+                        self.save_preds(vid_cap, i, str(self.save_dir / p.name))
+
+                self.run_callbacks("on_predict_batch_end")
+                yield from self.results
+
+                # Print time (inference-only)
+                if self.args.verbose:
+                    LOGGER.info(f"{s}{profilers[1].dt * 1E3:.1f}ms")
+
+        # Release assets
+        if isinstance(self.vid_writer[-1], cv2.VideoWriter):
+            self.vid_writer[-1].release()  # release final video writer
+
+        # Print results
+        if self.args.verbose and self.seen:
+            t = tuple(x.t / self.seen * 1e3 for x in profilers)  # speeds per image
+            LOGGER.info(
+                f"Speed: %.1fms preprocess, %.1fms inference, %.1fms postprocess per image at shape "
+                f"{(1, 3, *im.shape[2:])}" % t
+            )
+        if self.args.save or self.args.save_txt or self.args.save_crop:
+            nl = len(list(self.save_dir.glob("labels/*.txt")))  # number of labels
+            s = f"\n{nl} label{'s' * (nl > 1)} saved to {self.save_dir / 'labels'}" if self.args.save_txt else ""
+            LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}{s}")
+
+        self.run_callbacks("on_predict_end")
+
+def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = 640, sahi = False):
     args.model = pt_modelpath
     args.data = yaml_datapath
     args.imgsz = imgsz
@@ -170,7 +435,20 @@ def compile_validator(args, pt_modelpath, yaml_datapath, save_dir = Path('./sahi
     LOGGER.info(f'\nValidator {"SAHI" if sahi else ""} compiled successfully!')
     return validator
 
-def sahi_predict(detection_model, image_batch, slice_height = 640, slice_width = 640, overlap_height_ratio = 0.2, overlap_width_ratio = 0.2):
+def compile_predictor(args, pt_modelpath, save_dir, imgsz = 640, sahi = False):
+    args.model = pt_modelpath
+    args.sahi_imgsz = imgsz
+    predictor = DetectionPredictor_SAHI(args = args) if sahi else DetectionPredictor()
+    # predictor.model = pt_modelpath
+    predictor.save_dir = save_dir
+    predictor.args.conf = 0.25
+    predictor.imgsz = imgsz
+    predictor.args.imgsz
+
+    return predictor
+
+def sahi_predict(detection_model, image_batch, slice_height = SLICE_H, slice_width = SLICE_W, \
+                 overlap_height_ratio = OVERLAP_HEIGHT_RATIO, overlap_width_ratio = OVERLAP_WIDTH_RATIO):
     """
     detection_model : compiled from def get_sahi_model()
     image_batch : torch.Size([10, 3, 1280, 1280])
@@ -179,8 +457,9 @@ def sahi_predict(detection_model, image_batch, slice_height = 640, slice_width =
     batch_result = []
     for image in image_batch:
         box_annot = np.empty((0, 6)) #
-        image = image.cpu().numpy() * 255
-        image = np.transpose(image, (1, 2, 0)).astype(np.uint8)
+        if isinstance(image,  torch.Tensor):
+            image = image.cpu().numpy() * 255
+            image = np.transpose(image, (1, 2, 0)).astype(np.uint8) # in CHW
 
         result = get_sliced_prediction(
             image,
@@ -188,7 +467,8 @@ def sahi_predict(detection_model, image_batch, slice_height = 640, slice_width =
             slice_height=slice_height,
             slice_width=slice_width,
             overlap_height_ratio=overlap_height_ratio,
-            overlap_width_ratio=overlap_width_ratio
+            overlap_width_ratio=overlap_width_ratio,
+            verbose = VERBOSE_SAHI
         )
         for img_box in result.object_prediction_list:
             x1, y1, x2, y2 = img_box.bbox.to_xyxy()
