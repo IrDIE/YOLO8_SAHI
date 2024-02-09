@@ -17,13 +17,17 @@ from ultralytics.engine.results import Results
 import cv2
 import json
 
-
-VERBOSE_SAHI = 2
-
 SLICE_H = 640
 SLICE_W = 640
 OVERLAP_HEIGHT_RATIO = 0.2
 OVERLAP_WIDTH_RATIO = 0.2
+VERBOSE_SAHI = 2
+"""
+VERBOSE_SAHI: int
+            0: no print
+            1: print number of slices (default)
+            2: print number of slices and slice/prediction durations
+"""
 
 
 def get_category_mapping():

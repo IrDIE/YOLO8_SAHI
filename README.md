@@ -43,7 +43,14 @@ You will understand if SAHI inference help in your specific case
 * in `utils.get_category_mapping() change returned dictionary for your classes`
 * in `validation_sahi.main()` run `run_sahi_validation()` or `run_basic_validation()`
 * in `validation_sahi.main()` change paths for your .pt and .yaml, and set desired input imgsz 
-* also you can update size  of sliding window (`slice_width` and `slice_height`) in `utils.sahi_predict()` (640 default)
+  * also you can update size  of sliding window in head of `utils.sahi_predict()` :
+    ```python
+        VERBOSE_SAHI = 2
+        SLICE_H = 640
+        SLICE_W = 640
+        OVERLAP_HEIGHT_RATIO = 0.2
+        OVERLAP_WIDTH_RATIO = 0.2
+```
 
 
 
