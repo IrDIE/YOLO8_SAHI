@@ -20,11 +20,11 @@ def main():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     LOGGER.info(f'DEVICE ===>> {device}')
 
-    # run_sahi_validation or run_basic_validation
+    # VALIDATION
+    run_basic_validation(pt_model, yaml_datapath, args)
+    run_sahi_validation(pt_model, yaml_datapath, args, imgsz, device)
 
-    # run_basic_validation(pt_model, yaml_datapath, args)
-    # run_sahi_validation(pt_model, yaml_datapath, args, imgsz, device)
-
+    # PREDICTION (INFERENCE)
     run_sahi_prediction(args, pt_model, source = video1_source, imgsz = imgsz , device = device)
     run_basic_prediction(pt_model=pt_model, args = args, source=video1_source)
 
