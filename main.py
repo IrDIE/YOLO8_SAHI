@@ -8,11 +8,11 @@ import torch
 def main():
     warnings.filterwarnings("ignore")
     # here set your parameters
-    pt_model = './best.pt'
+    pt_model = './yolov8n.pt'
     yaml_datapath = './sahi_data.yaml' # for validation
-    imgsz = 640*2 # for sahi validation or prediction
+    imgsz = (640*2, 640*2) # for sahi validation or prediction in HW format. Set None for dynamic input (each image will be processed with original size)
     predict_source = './yolo_dataset/images'
-    video1_source = './1.mp4'
+    video1_source = './metadata/1.mp4'
 
 
     # defaults params
@@ -21,12 +21,12 @@ def main():
     LOGGER.info(f'DEVICE ===>> {device}')
 
     # VALIDATION
-    run_basic_validation(pt_model, yaml_datapath, args)
-    run_sahi_validation(pt_model, yaml_datapath, args, imgsz, device)
+    run_basic_validation(pt_model, yaml_datapath, args, imgsz)
+    run_sahi_validation(pt_model, yaml_datapath, args, imgsz)
 
     # PREDICTION (INFERENCE)
-    run_sahi_prediction(args, pt_model, source = video1_source, imgsz = imgsz , device = device)
-    run_basic_prediction(pt_model=pt_model, args = args, source=video1_source)
+    run_sahi_prediction(args, pt_model, source = predict_source, imgsz = imgsz)
+    run_basic_prediction(pt_model=pt_model, args = args, source=predict_source)
 
 if __name__ == '__main__':
     main()

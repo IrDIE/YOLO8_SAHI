@@ -19,8 +19,8 @@ from ultralytics.engine.results import Results
 import cv2
 import json
 
-SLICE_H = 320 # any multiple by 32 number
-SLICE_W = 320
+SLICE_H = 640 # any multiple by 32 number
+SLICE_W = 640
 OVERLAP_HEIGHT_RATIO = 0.2
 OVERLAP_WIDTH_RATIO = 0.2
 VERBOSE_SAHI = 0
