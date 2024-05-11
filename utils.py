@@ -5,11 +5,13 @@ from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device
 from ultralytics.models.yolo.detect import DetectionValidator, DetectionPredictor
 from sahi.predict import get_sliced_prediction
+from torchvision.transforms import v2
 from sahi import AutoDetectionModel
 import torch
 from pathlib import Path
 import numpy as np
 from ultralytics.utils.checks import check_imgsz, check_imshow
+from sahi.slicing import get_slice_bboxes
 import threading
 from ultralytics.cfg import get_save_dir
 from ultralytics.utils import LOGGER, ops
@@ -17,11 +19,11 @@ from ultralytics.engine.results import Results
 import cv2
 import json
 
-SLICE_H = 640
-SLICE_W = 640
+SLICE_H = 320 # any multiple by 32 number
+SLICE_W = 320
 OVERLAP_HEIGHT_RATIO = 0.2
 OVERLAP_WIDTH_RATIO = 0.2
-VERBOSE_SAHI = 2
+VERBOSE_SAHI = 0
 """
 VERBOSE_SAHI: int
             0: no print
@@ -139,13 +141,79 @@ class DetectionValidator_SAHI(DetectionValidator):
         """Initialize detection model with necessary variables and settings."""
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
 
-
-    def __call__(self, trainer=None, model=None, sahi_model=None):
+    def compute_window_shape(self, orig_shape, window_shape=[SLICE_H, SLICE_W]):
+        """
+        - we need compile model in advance with appropriate image size (yolo modela require imgsize be multiple 32)
+        - that function fix cases when inpur original resolution lower than required window-sahi size (for example 720 * 1080 == Yolo can't process 720 imgsize)
+        :param orig_shape: (720, 1280) tuple
+        :param window_shape: hyperparameter
+        :return: new shape model can be compiled with
+        """
+        h_orig, w_orig = orig_shape
+        if window_shape[0] > h_orig: window_shape[0] = (h_orig | 31) - 31
+        if window_shape[1] > w_orig: window_shape[1] = (w_orig | 31) - 31
+        return window_shape
+    def sahi_inference(
+            self,
+            im,
+            slice_height=SLICE_H,
+            slice_width=SLICE_W,
+            overlap_height_ratio=OVERLAP_HEIGHT_RATIO,
+            overlap_width_ratio=OVERLAP_WIDTH_RATIO,
+            *args,
+            **kwargs,
+    ):
+        """
+        detection_model : compiled from def get_sahi_model()
+        image_batch : torch.Size([10, 3, 1280, 1280])
+        run_usual : if run usual inference for all picture (not sliced) above sahi prediction
+        """
+        btch, ch, image_height, image_width = im.shape
+        # 1 - get sliced image coordinates
+        slice_bboxes = get_slice_bboxes(
+            image_height=image_height,
+            image_width=image_width,
+            slice_height=slice_height,
+            slice_width=slice_width,
+            overlap_height_ratio=overlap_height_ratio,
+            overlap_width_ratio=overlap_width_ratio,
+        )
+        # 2 - in loop do usual inference for each slice -> get predictions for each slice, append it to result list
+        # check later gpu availability
+        preds_all_slice_shifted = []
+        for x1, y1, x2, y2 in slice_bboxes:
+            # take all slices as batch = im and do inference on batch
+            preds = self.model(
+                im[:, :, y1:y2, x1:x2], *args, **kwargs
+            )  # im here is batch !!
+            if isinstance(
+                    preds, (list, tuple)
+            ):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+                preds_take = preds[0]
+            else:
+                preds_take = preds
+            preds_t = preds_take.transpose(-1, -2)
+            prediction_slice = preds_t[..., :4]  # in xywh
+            # shift prediction regarding to slice coordinates. got pregictionn regarding scale of original image
+            prediction_slice[:, :, 0] += x1  # shift x center
+            prediction_slice[:, :, 1] += y1  # shift y center
+            preds_t[..., :4] = prediction_slice  # shift preds
+            if isinstance(
+                    preds, (list, tuple)
+            ):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+                preds[0] = preds_t.transpose(-1, -2)
+                preds_all_slice_shifted.append(preds[0])
+            else:
+                preds = preds_t.transpose(-1, -2)
+                preds_all_slice_shifted.append(preds)
+        preds_all_slice_shifted_t = torch.cat((preds_all_slice_shifted), dim=2)
+        return preds_all_slice_shifted_t
+    def __call__(self, trainer=None, model=None):
         """Supports validation of a pre-trained model if passed or a model being trained if trainer is passed (trainer
         gets priority).
         """
         self.training = trainer is not None
-        self.sahi_model = sahi_model
+
         augment = self.args.augment and (not self.training)
         if self.training:
             self.device = trainer.device
@@ -189,14 +257,19 @@ class DetectionValidator_SAHI(DetectionValidator):
             self.stride = model.stride  # used in get_dataloader() for padding
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
             model.eval()
-            model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup
+
+            slice_h, slice_w = self.compute_window_shape((imgsz,imgsz), window_shape=[SLICE_H, SLICE_W])
+
+            model.warmup(imgsz=(1 if pt else self.args.batch, 3, slice_h, slice_w))  # warmup
+
         self.run_callbacks('on_val_start')
-        dt = Profile(), Profile(), Profile(), Profile(), Profile()
+        dt = Profile(), Profile(), Profile(), Profile()
         bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
         # bar is different
 
         self.init_metrics(de_parallel(model))
         self.jdict = []  # empty before each val
+        self.model = model
         for batch_i, batch in enumerate(bar):
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)
@@ -206,25 +279,59 @@ class DetectionValidator_SAHI(DetectionValidator):
             # Preprocess
 
             with dt[0]:
-                batch = self.preprocess(batch)
+
+                batch_sahi = self.preprocess(batch)
+                im = v2.Resize(size=(slice_h, slice_w))(batch_sahi["img"])
+                from_shape = im.shape[2:]
+                to_shape = batch_sahi["img"].shape[2:]
             # Inference
             with dt[1]:
-                if self.sahi_model is None:
-                    #LOGGER.info(f'\n batch[img] shape = {batch["img"].shape} ') # == batch[img] shape = torch.Size([3, 3, 640, 640])
-                    preds = model(batch['img'], augment=augment)
-            # SAHI INFERENCE
-            with dt[4]:
-                if self.sahi_model :
-                    preds = sahi_predict(self.sahi_model, batch['img'])
+                # -------------------
+                if self.usual_inference:
+                    preds = self.model(im, augment=augment)
+                    w_gain, h_gain = (
+                        to_shape[1] / from_shape[1],
+                        to_shape[0] / from_shape[0],
+                    )
+                    if isinstance(preds, (list, tuple)):
+                        transposed = preds[0].transpose(
+                            -1, -2
+                        )  # preds in xywh for torch.Size([640, 640])
+                        for box in transposed[..., :4]:
+                            box[:, 0] *= w_gain
+                            box[:, 1] *= h_gain
+                            box[:, 2] *= w_gain
+                            box[:, 3] *= h_gain
+                        scaled_xywh = transposed.transpose(-1, -2)
+                        preds[0] = scaled_xywh
+                    else:
+                        transposed = preds.transpose(
+                            -1, -2
+                        )  # preds in xywh for torch.Size([640, 640])
+                        for box in transposed[..., :4]:
+                            box[:, 0] *= w_gain
+                            box[:, 1] *= h_gain
+                            box[:, 2] *= w_gain
+                            box[:, 3] *= h_gain
+                        scaled_xywh = transposed.transpose(-1, -2)
+                        preds = scaled_xywh
+                if self.sahi:
+                    preds_sahi = self.sahi_inference(im=batch_sahi["img"], slice_height=slice_h, slice_width=slice_w, augment=False)
+                if self.sahi and self.usual_inference:
+                    if isinstance(preds, (list, tuple)):
+                        preds[0] = torch.cat((preds[0], preds_sahi), dim=2)
+                    else:
+                        preds = torch.cat((preds, preds_sahi), dim=2)
+
             # Loss
             with dt[2]:
                 if self.training:
                     self.loss += model.loss(batch, preds)[1]
             # Postprocess
             with dt[3]:
-                preds = self.postprocess(preds) if self.sahi_model is None else preds
-                #LOGGER.info(f'preds shape in Postprocess = {preds[1].shape}') #x1, y1, x2, y2, confidence, class : [ 84, 9, 639, 636, 0.89,16]
-                #[tensor([[ 8.4056e+01,  9.2479e+00,  6.3970e+02,  6.3664e+02,  8.9213e-01,  1.6000e+01], ...
+                if not self.usual_inference:
+                    preds = preds_sahi
+                preds = self.postprocess(preds, to_shape, batch["img"])
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:
                 self.plot_predictions(batch, preds, batch_i)
@@ -250,6 +357,18 @@ class DetectionValidator_SAHI(DetectionValidator):
             if self.args.plots or self.args.save_json:
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
             return stats
+    def postprocess(self, preds, from_shape, orig_imgs):
+        """Post-processes predictions and returns a list of Results objects.
+        from_shape : img.shape[2:]
+        """
+        return ops.non_max_suppression(
+            preds,
+            self.args.conf,
+            self.args.iou,
+            agnostic=self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            classes=self.args.classes,
+        )
 
 
 class DetectionPredictor_SAHI(DetectionPredictor):
@@ -291,82 +410,206 @@ class DetectionPredictor_SAHI(DetectionPredictor):
     # def __call__(self, source=None, model=None, stream=False, *args, **kwargs):
     #     return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Result into one
 
-    def __call__(self, source=None, model=None, stream=False,sahi_model=None, *args, **kwargs):
-        return list(self.stream_inference(source, model,sahi_model = sahi_model, *args, **kwargs))  # merge list of Result into one
+    def __call__(self, source=None, model=None, stream=False, *args, **kwargs):
 
-    def postprocess_sahi(self, preds, img, orig_imgs):
-        """Post-processes predictions and returns a list of Results objects."""
-        if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
+        self.stream = stream
+        if stream:
+            return self.stream_inference(source, model, *args, **kwargs)
+        else:
+            return list(
+                self.stream_inference(source, model,*args, **kwargs)
+            )
+
+    def compute_window_shape(self, orig_shape, window_shape=[SLICE_H, SLICE_W]):
+        """
+        - we need compile model in advance with appropriate image size (yolo modela require imgsize be multiple 32)
+        - that function fix cases when inpur original resolution lower than required window-sahi size (for example 720 * 1080 == Yolo can't process 720 imgsize)
+        :param orig_shape: (720, 1280) tuple
+        :param window_shape: hyperparameter
+        :return: new shape model can be compiled with
+        """
+        h_orig, w_orig = orig_shape
+        if window_shape[0] > h_orig: window_shape[0] = (h_orig | 31) - 31
+        if window_shape[1] > w_orig: window_shape[1] = (w_orig | 31) - 31
+        return window_shape
+    def sahi_inference(
+            self,
+            im,
+            slice_height=SLICE_H,
+            slice_width=SLICE_W,
+            overlap_height_ratio=OVERLAP_HEIGHT_RATIO,
+            overlap_width_ratio=OVERLAP_WIDTH_RATIO,
+            *args,
+            **kwargs,
+    ):
+        """
+        detection_model : compiled from def get_sahi_model()
+        image_batch : torch.Size([10, 3, 1280, 1280])
+        run_usual : if run usual inference for all picture (not sliced) above sahi prediction
+        """
+        btch, ch, image_height, image_width = im.shape
+        # 1 - get sliced image coordinates
+        slice_bboxes = get_slice_bboxes(
+            image_height=image_height,
+            image_width=image_width,
+            slice_height=slice_height,
+            slice_width=slice_width,
+            overlap_height_ratio=overlap_height_ratio,
+            overlap_width_ratio=overlap_width_ratio,
+        )
+        # 2 - in loop do usual inference for each slice -> get predictions for each slice, append it to result list
+        # check later gpu availability
+        preds_all_slice_shifted = []
+        for x1, y1, x2, y2 in slice_bboxes:
+            # take all slices as batch = im and do inference on batch
+            preds = self.inference(
+                im[:, :, y1:y2, x1:x2], *args, **kwargs
+            )  # im here is batch !!
+            if isinstance(
+                    preds, (list, tuple)
+            ):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+                preds_take = preds[0]
+            else:
+                preds_take = preds
+            preds_t = preds_take.transpose(-1, -2)
+            prediction_slice = preds_t[..., :4]  # in xywh
+            # shift prediction regarding to slice coordinates. got pregictionn regarding scale of original image
+            prediction_slice[:, :, 0] += x1  # shift x center
+            prediction_slice[:, :, 1] += y1  # shift y center
+            preds_t[..., :4] = prediction_slice  # shift preds
+            if isinstance(
+                    preds, (list, tuple)
+            ):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
+                preds[0] = preds_t.transpose(-1, -2)
+                preds_all_slice_shifted.append(preds[0])
+            else:
+                preds = preds_t.transpose(-1, -2)
+                preds_all_slice_shifted.append(preds)
+        preds_all_slice_shifted_t = torch.cat((preds_all_slice_shifted), dim=2)
+        return preds_all_slice_shifted_t
+
+    def postprocess(self, preds, from_shape, orig_imgs):
+        """Post-processes predictions and returns a list of Results objects.
+        from_shape : img.shape[2:]
+        """
+        preds = ops.non_max_suppression(
+            preds,
+            self.args.conf,
+            self.args.iou,
+            agnostic=self.args.agnostic_nms,
+            max_det=self.args.max_det,
+            classes=self.args.classes,
+        )
+        if not isinstance(
+                orig_imgs, list
+        ):  # input images are a torch.Tensor, not a list
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
-
         results = []
         for i, pred in enumerate(preds):
             orig_img = orig_imgs[i]
-            #pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+            pred[:, :4] = ops.scale_boxes(from_shape, pred[:, :4], orig_img.shape)
             img_path = self.batch[0][i]
-            results.append(Results(orig_img, path=img_path, names=self.model.names, boxes=pred))
+            results.append(
+                Results(orig_img, path=img_path, names=self.model.names, boxes=pred)
+            )
         return results
-    def stream_inference(self, source=None, model=None, sahi_model=None, *args, **kwargs):
+    def stream_inference(self, source=None, model=None, *args, **kwargs):
         """Streams real-time inference on camera feed and saves results to file."""
-        self.sahi_model = sahi_model
-        if self.args.verbose:
-            LOGGER.info("")
 
         # Setup model
-        if not self.model :
+        if not self.model:
             self.setup_model(model)
-
         self.nc = len(self.model.names)
         self.stride = self.model.stride
-
         with self._lock:  # for thread-safe inference
             # Setup source every time predict is called
             self.setup_source(source if source is not None else self.args.source)
+
             self.imgsz = self.args.sahi_imgsz
+            if self.args.dynamic_input : LOGGER.warning("\nWARNING! Set dynamic_input = True : using original image size for each prediction that can take more time.\n")
+
             # Check if save_dir/ label file exists
             if self.args.save or self.args.save_txt:
-                (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
-
+                (
+                    self.save_dir / "labels" if self.args.save_txt else self.save_dir
+                ).mkdir(parents=True, exist_ok=True)
             # Warmup model
-            if not self.done_warmup and (self.sahi_model is None):
-                self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
-                self.done_warmup = True
 
             self.seen, self.windows, self.batch = 0, [], None
-            profilers = (
-                Profile(), Profile(), Profile()
-            )
+            profilers = (Profile(), Profile(), Profile())
             self.run_callbacks("on_predict_start")
             for batch in self.dataset:
-                self.run_callbacks("on_predict_batch_start")
+                # self.run_callbacks("on_predict_batch_start")
                 self.batch = batch
                 path, im0s, vid_cap, s = batch
+                input_image_shape = np.shape(im0s[0])[:2]
+                if self.args.dynamic_input:
+                    self.imgsz = input_image_shape # HW
+                    LOGGER.info(f'\n*** set self.imgsz as original image shape = {self.imgsz}')
 
+                slice_h, slice_w = self.compute_window_shape(self.imgsz, window_shape=[SLICE_H, SLICE_W])
+
+                if not self.done_warmup:
+                    self.model.warmup(
+                        imgsz=(
+                            1 if self.model.pt or self.model.triton else self.dataset.bs,
+                            3,
+                            slice_h,
+                            slice_w,
+                        )
+                    )
+                    self.done_warmup = True
                 # Preprocess
                 with profilers[0]:
-                    im = self.preprocess(im0s) # CHW
-                    im_sahi = im0s
-
+                    im_sahi = self.preprocess(im0s)  # CHW
+                    im = v2.Resize(size=(slice_h, slice_w))(im_sahi)
+                    from_shape = im.shape[2:]
+                    to_shape = im_sahi.shape[2:]
                 # Inference
                 with profilers[1]:
-                    if self.sahi_model is None:
+                    if self.args.usual_inference:
                         preds = self.inference(im, *args, **kwargs)
-                        if self.args.embed:
-                            yield from [preds] if isinstance(preds, torch.Tensor) else preds  # yield embedding tensors
-                            continue
-
-                    if self.sahi_model:
-                        preds = sahi_predict(self.sahi_model, im_sahi)
-
+                        w_gain, h_gain = (
+                            to_shape[1] / from_shape[1],
+                            to_shape[0] / from_shape[0],
+                        )
+                        if isinstance(preds, (list, tuple)):
+                            transposed = preds[0].transpose(
+                                -1, -2
+                            )  # preds in xywh for torch.Size([640, 640])
+                            for box in transposed[..., :4]:
+                                box[:, 0] *= w_gain
+                                box[:, 1] *= h_gain
+                                box[:, 2] *= w_gain
+                                box[:, 3] *= h_gain
+                            scaled_xywh = transposed.transpose(-1, -2)
+                            preds[0] = scaled_xywh
+                        else:
+                            transposed = preds.transpose(
+                                -1, -2
+                            )  # preds in xywh for torch.Size([640, 640])
+                            for box in transposed[..., :4]:
+                                box[:, 0] *= w_gain
+                                box[:, 1] *= h_gain
+                                box[:, 2] *= w_gain
+                                box[:, 3] *= h_gain
+                            scaled_xywh = transposed.transpose(-1, -2)
+                            preds = scaled_xywh
+                    if self.args.sahi:
+                        preds_sahi = self.sahi_inference(im=im_sahi, slice_height=slice_h, slice_width=slice_w)
+                    if self.args.sahi and self.args.usual_inference:
+                        if isinstance(preds, (list, tuple)):
+                            preds[0] = torch.cat((preds[0], preds_sahi), dim=2)
+                        else:
+                            preds = torch.cat((preds, preds_sahi), dim=2)
                 # Postprocess
-
                 with profilers[2]:
-                    if self.sahi_model is None:
-                        self.results = self.postprocess(preds, im, im0s)
-                    else:
-                        self.results = self.postprocess_sahi(preds, im, im0s)
+                    if not self.args.usual_inference:
+                        preds = preds_sahi
+                    self.results = self.postprocess(preds, to_shape, im0s)
 
                 self.run_callbacks("on_predict_postprocess_end")
+
                 # Visualize, save, write results
                 n = len(im0s)
                 for i in range(n):
@@ -413,10 +656,12 @@ class DetectionPredictor_SAHI(DetectionPredictor):
 
         self.run_callbacks("on_predict_end")
 
-def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = 640, sahi = False):
+def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = None, sahi = False, usual_inference=True):
     args.model = pt_modelpath
     args.data = yaml_datapath
     args.imgsz = imgsz
+
+
 
     validator = DetectionValidator_SAHI(args=args,save_dir=save_dir) if sahi else DetectionValidator(args=args,save_dir=save_dir)
     validator.is_coco = False
@@ -430,6 +675,8 @@ def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = 640, 
     )
 
     validator.names = model.names
+    validator.sahi = sahi
+    validator.usual_inference = usual_inference
     validator.nc = len(model.names)
     validator.metrics.names = validator.names
     validator.metrics.plot = validator.args.plots
@@ -439,15 +686,21 @@ def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = 640, 
     LOGGER.info(f'\nValidator {"SAHI" if sahi else ""} compiled successfully!')
     return validator
 
-def compile_predictor(args, pt_modelpath, save_dir, imgsz = 640, sahi = False):
+def compile_predictor(args, pt_modelpath, save_dir, iou_thr = 0.5, conf = 0.5, imgsz = None, sahi = False, usual_inference = True):
+    args.iou = iou_thr
+    args.conf = conf
     args.model = pt_modelpath
+    args.sahi = sahi
+    args.usual_inference = usual_inference
     args.sahi_imgsz = imgsz
+    args.dynamic_input = True if imgsz is None else False
+
     predictor = DetectionPredictor_SAHI(args = args) if sahi else DetectionPredictor()
     # predictor.model = pt_modelpath
     predictor.save_dir = save_dir
-    predictor.args.conf = 0.25
-    predictor.imgsz = imgsz
-    predictor.args.imgsz
+    # predictor.device = device
+    # predictor.imgsz = imgsz
+    # predictor.args.imgsz
 
     return predictor
 
