@@ -10,7 +10,7 @@ def main():
     # here set your parameters
     pt_model = './yolov8n.pt'
     yaml_datapath = './sahi_data.yaml' # for validation
-    imgsz = (640*2, 640*2) # for sahi validation or prediction in HW format. Set None for dynamic input (each image will be processed with original size)
+    imgsz = (640*2, 640*2) # for sahi validation or prediction in HW format. Set None for dynamic input for prediction (each image will be processed with original size)
     predict_source = './yolo_dataset/images'
     video1_source = './metadata/1.mp4'
 
