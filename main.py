@@ -22,7 +22,7 @@ def main():
 
     # VALIDATION
     run_basic_validation(pt_model, yaml_datapath, args, imgsz)
-    run_sahi_validation(pt_model, yaml_datapath, args, imgsz)
+    run_sahi_validation(pt_model, yaml_datapath,  args, imgsz)
 
     # PREDICTION (INFERENCE)
     run_sahi_prediction(args, pt_model, source = predict_source, imgsz = imgsz)

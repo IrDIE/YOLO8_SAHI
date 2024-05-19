@@ -4,20 +4,23 @@ from ultralytics.utils import TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device
 from ultralytics.models.yolo.detect import DetectionValidator, DetectionPredictor
-from sahi.predict import get_sliced_prediction
-from torchvision.transforms import v2
-from sahi import AutoDetectionModel
-import torch
-from pathlib import Path
-import numpy as np
 from ultralytics.utils.checks import check_imgsz, check_imshow
-from sahi.slicing import get_slice_bboxes
-import threading
 from ultralytics.cfg import get_save_dir
 from ultralytics.utils import LOGGER, ops
 from ultralytics.engine.results import Results
+from ultralytics.utils.metrics import  DetMetrics
+
+from sahi.slicing import get_slice_bboxes
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
+
 import cv2
 import json
+import threading
+import torch
+from torchvision.transforms import v2
+from pathlib import Path
+import numpy as np
 
 SLICE_H = 640 # any multiple by 32 number
 SLICE_W = 640
@@ -139,7 +142,43 @@ class DetectionValidator_SAHI(DetectionValidator):
         """
     def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
         """Initialize detection model with necessary variables and settings."""
-        super().__init__(dataloader, save_dir, pbar, args, _callbacks)
+        self.args = args
+        self.dataloader = dataloader
+        self.pbar = pbar
+        self.stride = None
+        self.data = None
+        self.device = None
+        self.batch_i = None
+        self.training = True
+        self.names = None
+        self.seen = None
+        self.stats = None
+        self.confusion_matrix = None
+        self.nc = None
+        self.iouv = None
+        self.jdict = None
+        self.speed = {'preprocess': 0.0, 'inference': 0.0, 'loss': 0.0, 'postprocess': 0.0}
+
+        self.save_dir = save_dir or get_save_dir(self.args)
+        (self.save_dir / 'labels' if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
+        if self.args.conf is None:
+            self.args.conf = 0.001  # default conf=0.001
+        self.args.imgsz = check_imgsz(self.args.imgsz, max_dim=1) if self.args.imgsz is not None else self.args.imgsz
+        self.plots = {}
+        self.callbacks = _callbacks or callbacks.get_default_callbacks()
+        self.nt_per_class = None
+        self.is_coco = False
+        self.class_map = None
+        self.args.task = 'detect'
+        self.metrics = DetMetrics(save_dir=self.save_dir, on_plot=self.on_plot)
+        self.iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
+        self.niou = self.iouv.numel()
+        self.lb = []  # for autolabelling
+
+
+
+
+        # super().__init__(dataloader, save_dir, pbar, args, _callbacks)
 
     def compute_window_shape(self, orig_shape, window_shape=[SLICE_H, SLICE_W]):
         """
@@ -236,7 +275,9 @@ class DetectionValidator_SAHI(DetectionValidator):
             self.device = model.device  # update device
             self.args.half = model.fp16  # update half
             stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
-            imgsz = check_imgsz(self.args.imgsz, stride=stride)
+
+            imgsz = check_imgsz(self.args.imgsz, stride=stride) if self.args.imgsz is not None else self.args.imgsz
+
             if engine:
                 self.args.batch = model.batch_size
             elif not pt and not jit:
@@ -255,12 +296,15 @@ class DetectionValidator_SAHI(DetectionValidator):
             if not pt:
                 self.args.rect = False
             self.stride = model.stride  # used in get_dataloader() for padding
+
+            if self.args.imgsz is None :
+                self.args.batch = 1
+                LOGGER.info(f'Forcing batch=1 : self.args.imgsz is None\nOriginal image size will be used for SAHI-validation')
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
             model.eval()
-
-            slice_h, slice_w = self.compute_window_shape((imgsz,imgsz), window_shape=[SLICE_H, SLICE_W])
-
-            model.warmup(imgsz=(1 if pt else self.args.batch, 3, slice_h, slice_w))  # warmup
+            if imgsz is not None:
+                slice_h, slice_w = self.compute_window_shape((imgsz,imgsz), window_shape=[SLICE_H, SLICE_W])
+                model.warmup(imgsz=(1 if pt else self.args.batch, 3, slice_h, slice_w))  # warmup
 
         self.run_callbacks('on_val_start')
         dt = Profile(), Profile(), Profile(), Profile()
@@ -268,9 +312,27 @@ class DetectionValidator_SAHI(DetectionValidator):
         # bar is different
 
         self.init_metrics(de_parallel(model))
+
         self.jdict = []  # empty before each val
         self.model = model
+
+        if self.args.imgsz is None:
+            LOGGER.info(f'started monkeypatching')
+            import types
+            from validation_loader import load_image, get_image_and_label
+            self.dataloader.dataset.load_image = types.MethodType(load_image, self.dataloader.dataset)
+            self.dataloader.dataset.get_image_and_label = types.MethodType(get_image_and_label, self.dataloader.dataset)
+
         for batch_i, batch in enumerate(bar):
+
+
+            if self.args.imgsz is None: # must calculate window shape here foe original-sized prediction
+                imgsz = batch["img"].shape[2:]
+                slice_h, slice_w = self.compute_window_shape(imgsz, window_shape=[SLICE_H, SLICE_W])
+                model.warmup(imgsz=(1 if pt else self.args.batch, 3, slice_h, slice_w))
+                # slice_h, slice_w = self.compute_window_shape(self.imgsz, window_shape=[SLICE_H, SLICE_W])
+
+
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)
 
@@ -279,9 +341,8 @@ class DetectionValidator_SAHI(DetectionValidator):
             # Preprocess
 
             with dt[0]:
-
                 batch_sahi = self.preprocess(batch)
-                im = v2.Resize(size=(slice_h, slice_w))(batch_sahi["img"])
+                im = v2.Resize(size=(slice_h, slice_w))(batch_sahi["img"]) # image for not-sahi inference
                 from_shape = im.shape[2:]
                 to_shape = batch_sahi["img"].shape[2:]
             # Inference
@@ -332,6 +393,7 @@ class DetectionValidator_SAHI(DetectionValidator):
                 if not self.usual_inference:
                     preds = preds_sahi
                 preds = self.postprocess(preds, to_shape, batch["img"])
+
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:
                 self.plot_predictions(batch, preds, batch_i)
@@ -371,6 +433,9 @@ class DetectionValidator_SAHI(DetectionValidator):
         )
 
 
+
+
+
 class DetectionPredictor_SAHI(DetectionPredictor):
 
     def __init__(self, args, overrides=None, _callbacks=None):
@@ -406,9 +471,6 @@ class DetectionPredictor_SAHI(DetectionPredictor):
         self.txt_path = None
         self._lock = threading.Lock()  # for automatic thread-safe inference
         callbacks.add_integration_callbacks(self)
-
-    # def __call__(self, source=None, model=None, stream=False, *args, **kwargs):
-    #     return list(self.stream_inference(source, model, *args, **kwargs))  # merge list of Result into one
 
     def __call__(self, source=None, model=None, stream=False, *args, **kwargs):
 
@@ -548,7 +610,6 @@ class DetectionPredictor_SAHI(DetectionPredictor):
                     LOGGER.info(f'\n*** set self.imgsz as original image shape = {self.imgsz}')
 
                 slice_h, slice_w = self.compute_window_shape(self.imgsz, window_shape=[SLICE_H, SLICE_W])
-
                 if not self.done_warmup:
                     self.model.warmup(
                         imgsz=(
@@ -661,10 +722,9 @@ def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = None,
     args.data = yaml_datapath
     args.imgsz = imgsz
 
-
-
     validator = DetectionValidator_SAHI(args=args,save_dir=save_dir) if sahi else DetectionValidator(args=args,save_dir=save_dir)
     validator.is_coco = False
+    validator.training = False
 
     model = AutoBackend(
         validator.args.model,
@@ -681,7 +741,7 @@ def compile_validator(args, pt_modelpath, yaml_datapath, save_dir, imgsz = None,
     validator.metrics.names = validator.names
     validator.metrics.plot = validator.args.plots
     validator.data = check_det_dataset(args.data)
-    validator.training = False
+
     validator.stride = model.stride
     LOGGER.info(f'\nValidator {"SAHI" if sahi else ""} compiled successfully!')
     return validator

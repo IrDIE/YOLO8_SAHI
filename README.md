@@ -2,7 +2,12 @@
 
 ### What is SAHI (Slicing Aided Hyper Inference) - https://docs.ultralytics.com/guides/sahi-tiled-inference/
 ### What in this repo:
-This repo contain not only SAHI inference implementation but also evaluation of results with mAp50, ... (standart metrics)
+This repo contain not only SAHI inference implementation but also evaluation of results with mAp50, ... (standart metrics).
+
+If `imgsz = None` in `main()` function :
+  
+  * prediction will be done with original imagesize
+  * validation will be done with original imagesize ( force batch size to 1 )
 
 You will understand if SAHI inference help in your specific case
 
@@ -55,7 +60,7 @@ You will understand if SAHI inference help in your specific case
 
 
 ## What you need:
-* your .pt model file
+* your .pt model file (or any format that ultralytics support - like .onnx or .engine)
 * validation dataset in yolo standart format
 * .yaml file for dataset
   * ```angular2html
