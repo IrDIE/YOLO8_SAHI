@@ -45,17 +45,17 @@ You will understand if SAHI inference help in your specific case
 ## How to use:
 
 * git clone
-* in `utils.get_category_mapping() change returned dictionary for your classes`
 * in `main()` change paths for your .pt and .yaml, and set desired input imgsz, source for inference etc
 * VALIDATION : in `main()` run `run_sahi_validation()` or `run_basic_validation()`
 * INFERENCE : in `main()` run `run_sahi_prediction()` or `run_basic_prediction()`
-  * also you can update size  of sliding window in head of `utils.sahi_predict()` :
+  * also you can update size  of sliding window in head of `utils.py` file :
     ```python
         VERBOSE_SAHI = 2
         SLICE_H = 640
         SLICE_W = 640
         OVERLAP_HEIGHT_RATIO = 0.2
-        OVERLAP_WIDTH_RATIO = 0.2```
+        OVERLAP_WIDTH_RATIO = 0.2
+    ```
 
 
 
